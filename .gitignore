@@ -1,0 +1,8 @@
+node_modules/
+dist/
+*.tsbuildinfo
+user*.csv
+.idea
+backup_user*.csv
+ubpm.json
+*.html

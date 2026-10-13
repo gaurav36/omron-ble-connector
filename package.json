@@ -1,0 +1,27 @@
+{
+  "name": "omron-ble-connector",
+  "version": "1.0.0",
+  "private": true,
+  "type": "commonjs",
+  "description": "TypeScript BLE connector for Omron blood pressure monitors",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "bin": {
+    "omron-ble-connector": "dist/cli.js"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "start": "node dist/cli.js",
+    "test": "npm run build && node --test dist/devices.test.js dist/plot-csv.test.js dist/protocol.test.js dist/storage.test.js"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "@stoprocent/noble": "^2.8.0"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "typescript": "6.0.3"
+  }
+}
