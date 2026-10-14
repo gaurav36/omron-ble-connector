@@ -14,6 +14,11 @@ interface ResponsePacket {
   data: Buffer;
 }
 
+function sameUuid(left: string, right: string): boolean {
+  // Noble reports UUIDs without dashes on some platforms (Windows).
+  return left.replace(/-/g, '').toLowerCase() === right.replace(/-/g, '').toLowerCase();
+}
+
 interface PendingResponse {
   resolve(packet: ResponsePacket): void;
   reject(error: Error): void;
@@ -28,6 +33,7 @@ export class OmronBleTransport {
   private readonly subscribedChannels = new Set<number>();
   private notificationsEnabled = false;
   private pendingResponse: PendingResponse | undefined;
+  private discoveredCharacteristics: Characteristic[] = [];
 
   constructor(
     private readonly peripheral: Peripheral,
@@ -37,17 +43,18 @@ export class OmronBleTransport {
 
   async initialize(): Promise<void> {
     const { services, characteristics } = await this.peripheral.discoverAllServicesAndCharacteristicsAsync();
-    if (!services.some((service) => service.uuid.toLowerCase() === this.device.parentServiceUuid.toLowerCase())) {
+    this.discoveredCharacteristics = characteristics;
+    if (!services.some((service) => sameUuid(service.uuid, this.device.parentServiceUuid))) {
       throw new Error(`Required Omron BLE service ${this.device.parentServiceUuid} was not found`);
     }
 
     for (const uuid of this.device.rxChannelUuids) {
-      const characteristic = characteristics.find((item) => item.uuid.toLowerCase() === uuid.toLowerCase());
+      const characteristic = characteristics.find((item) => sameUuid(item.uuid, uuid));
       if (!characteristic) throw new Error(`BLE receive characteristic ${uuid} was not found`);
       this.rxCharacteristics.push(characteristic);
     }
     for (const uuid of this.device.txChannelUuids) {
-      const characteristic = characteristics.find((item) => item.uuid.toLowerCase() === uuid.toLowerCase());
+      const characteristic = characteristics.find((item) => sameUuid(item.uuid, uuid));
       if (!characteristic) throw new Error(`BLE transmit characteristic ${uuid} was not found`);
       this.txCharacteristics.push(characteristic);
     }
@@ -101,11 +108,14 @@ export class OmronBleTransport {
   async writeNewUnlockKey(key: Buffer): Promise<void> {
     if (!this.device.supportsPairing) throw new Error(`${this.device.model} does not support custom-key pairing`);
     if (key.length !== 16) throw new RangeError(`Pairing key must be 16 bytes, received ${key.length}`);
+    this.logger.debug('Discovering unlock characteristic');
     const characteristic = await this.unlockCharacteristic();
     const rx = this.rxCharacteristics[0];
     if (!rx) throw new Error('No receive characteristic is configured');
+    this.logger.debug('Subscribing to receive channel 0');
     await rx.subscribeAsync();
     try {
+      this.logger.debug('Subscribing to unlock characteristic');
       await characteristic.subscribeAsync();
       let response: Buffer | undefined;
       for (let attempt = 1; attempt <= 10; attempt++) {
@@ -307,9 +317,9 @@ export class OmronBleTransport {
   }
 
   private async unlockCharacteristic(): Promise<Characteristic> {
-    const { characteristics } = await this.peripheral.discoverAllServicesAndCharacteristicsAsync();
-    const characteristic = characteristics.find(
-      (item) => item.uuid.toLowerCase() === this.device.unlockUuid.toLowerCase(),
+    // Re-running discovery returns new objects on Windows and stalls subscriptions made on the originals.
+    const characteristic = this.discoveredCharacteristics.find(
+      (item) => sameUuid(item.uuid, this.device.unlockUuid),
     );
     if (!characteristic) throw new Error(`BLE unlock characteristic ${this.device.unlockUuid} was not found`);
     return characteristic;

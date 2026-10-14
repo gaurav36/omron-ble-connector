@@ -13,7 +13,7 @@ npm install
 npm run build
 ```
 
-Platform BLE access depends on Noble's native bindings and system Bluetooth stack. On Linux, BlueZ must be installed and the process needs permission to access the adapter. The default adapter is selected automatically; `--adapter hci1` selects a Linux HCI adapter explicitly. On Windows, pairing prompts and bonding are managed by Windows Bluetooth.
+Platform BLE access depends on Noble's native bindings and system Bluetooth stack. On Linux, BlueZ must be installed and the process needs permission to access the adapter. The default adapter is selected automatically; `--adapter hci1` selects a Linux HCI adapter explicitly. On Windows, `--pair` bonds with the monitor automatically and accepts the Windows pairing prompt without user interaction.
 
 ## Read measurements
 
@@ -38,7 +38,56 @@ Without `--mac`, the connector scans for eight seconds, lists discovered devices
 | HEM-7600T | `hem-7600t` |
 | HEM-6232T | `hem-6232t` |
 
+## RS7 Intelli IT (HEM-6232T) on Windows
+
+Install dependencies and build the project:
+
+```powershell
+npm install
+npm run build
+```
+
+Follow these steps in order:
+
+1. **Pair once, if the monitor is not already paired.** If Windows has an old pairing saved, remove it from **Settings → Bluetooth & devices** first. Turn off Bluetooth on phones running the Omron app. Press and keep holding the monitor's Bluetooth button until `-P-` appears on the screen, then release the button. The pairing indicator stays on for about two minutes; run the pairing command while it is visible:
+
+   ```powershell
+   npm start -- --device hem-6232t --mac "00:5f:bf:93:fe:39" --pair
+   ```
+
+   Do not repeat this pairing step for every reading. Once paired, continue with step 2 on future readings.
+
+2. **Take a blood-pressure measurement manually.** Put on the monitor and press its physical **START/STOP** button. Wait for the measurement to finish and be saved. The connector downloads saved measurements; it does not initiate a measurement.
+
+3. **Enable Bluetooth transfer.** Press the monitor's Bluetooth button to make it available for transfer.
+
+4. **Download the reading(s)** by running:
+
+   ```powershell
+   npm start -- --device hem-6232t --mac "00:5f:bf:93:fe:39"
+   ```
+
+   By default, this reads all stored records. To read only unread records and reset the monitor's unread-record counter, use:
+
+   ```powershell
+   npm start -- --device hem-6232t --mac "00:5f:bf:93:fe:39" --newRecOnly
+   ```
+
+   For BLE diagnostics, add `--loggerDebug`:
+
+   ```powershell
+   npm start -- --device hem-6232t --mac "00:5f:bf:93:fe:39" --loggerDebug
+   ```
+
+The `--` after `npm start` passes CLI options through npm. To run the built CLI directly without that separator, use `node .\dist\cli.js` instead, for example:
+
+```powershell
+node .\dist\cli.js --device hem-6232t --mac "00:5f:bf:93:fe:39"
+```
+
 Use `--pair` once for initial pairing. Most models use Omron key programming; HEM-7377T1 and HEM-7380T1 require OS-level bonding and should be paired through the operating system on platforms where Noble does not provide native bonding. Subsequent reads use the default key `deadbeaf12341234deadbeaf12341234`; `--key` accepts a custom 32-character hexadecimal key.
+
+Windows pairing procedure: turn off Bluetooth on phones that have the Omron app, remove any existing Windows pairing of the monitor (Settings → Bluetooth & devices), hold the monitor's Bluetooth button until `-P-` blinks, then run the `--pair` command immediately. The monitor forgets its keys when it enters pairing mode, so a leftover Windows bond makes it unreachable. For later reads, press the monitor's Bluetooth button to start transfer mode; the monitor is only connectable for a short time, and "Device is unreachable" means it is not currently connectable. The monitor accepts a single connection, so close the Omron phone app first. Omron monitors advertise as `BLEsmart_<model><address>`, and the device chooser marks them with `<- Omron`; `--mac` connects directly without scanning.
 
 Options:
 
@@ -56,6 +105,14 @@ Options:
 `--newRecOnly` and `--timeSync` write settings back to device EEPROM. Only use them with a supported model and a device whose settings layout is known. HEM-7377T1's unread-counter location is not mapped, so new-record-only mode will not find records for that model. HEM-6232T and HEM-7530T do not support time synchronization in this connector.
 
 Each successful read writes `user1.csv`, `user2.csv` as applicable, and `ubpm.json` in the current directory. Existing CSVs are backed up before being merged; records with a timestamp present in the latest read are replaced by that read's version.
+
+## Verified physical devices
+
+The following device has been tested end to end with this connector. Other entries in the supported-model list have not been physically verified as part of this project session.
+
+| Device | Test environment | Pairing | Readout |
+| --- | --- | --- | --- |
+| HEM-6232T / RS7 Intelli IT | Windows, BLE | Pairing succeeded; key programmed | Read succeeded; 4 stored records exported |
 
 ## Plot exported CSV
 

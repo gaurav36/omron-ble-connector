@@ -5,6 +5,7 @@ import { createInterface } from 'node:readline/promises';
 import { stdin, stdout } from 'node:process';
 import { createPlot } from './plot-csv';
 import { getDeviceProfile } from './devices';
+import type { DeviceProfile } from './types';
 import { OmronBleTransport, readDeviceRecords, type Logger } from './protocol';
 import { saveRecords } from './storage';
 
@@ -18,6 +19,10 @@ interface CliOptions {
   adapter?: string;
   debug: boolean;
 }
+
+// Windows DevicePairingKinds ConfirmOnly | DisplayPin | ConfirmPinMatch. Noble's exported
+// DevicePairingKinds constants do not match these WinRT values, so the raw mask is used.
+const windowsPairingKinds = 0x1 | 0x2 | 0x8;
 
 const logger: Logger = {
   debug: (message) => {
@@ -50,14 +55,31 @@ async function main(args: string[]): Promise<void> {
   }
 
   const noble = makeNoble(options.adapter);
-  const peripherals = await discoverPeripherals(noble, options.address);
-  const peripheral = options.address
-    ? peripherals.find((item) => addressMatches(item, options.address!))
-    : await choosePeripheral(noble, peripherals);
-  if (!peripheral) throw new Error(`Bluetooth device ${options.address} was not found while scanning`);
+  let peripheral: Peripheral | undefined;
+  if (options.address) {
+    // Connecting without a scan avoids missing the short window in which the monitor accepts connections.
+    logger.info(`Connecting to ${options.address}`);
+    try {
+      await noble.waitForPoweredOnAsync(20_000);
+      peripheral = await noble.connectAsync(options.address);
+    } catch (error) {
+      logger.warn(`Direct connection failed (${errorMessage(error)}); scanning for the device`);
+    }
+  }
+  if (!peripheral) {
+    const peripherals = await discoverPeripherals(noble, options.address);
+    peripheral = options.address
+      ? peripherals.find((item) => addressMatches(item, options.address!))
+      : await choosePeripheral(noble, peripherals);
+    if (!peripheral) throw new Error(`Bluetooth device ${options.address} was not found while scanning`);
 
-  logger.info(`Connecting to ${peripheral.address || peripheral.id}${peripheral.advertisement.localName ? ` (${peripheral.advertisement.localName})` : ''}`);
-  await peripheral.connectAsync();
+    const localName = peripheral.advertisement.localName;
+    if (localName && !isOmronName(peripheral)) {
+      logger.warn(`Selected device "${localName}" does not advertise an Omron name (BLEsmart_...); it may not be the monitor`);
+    }
+    logger.info(`Connecting to ${peripheral.address || peripheral.id}${localName ? ` (${localName})` : ''}`);
+    await peripheral.connectAsync();
+  }
   let transport: OmronBleTransport | undefined;
   try {
     if (options.pair && device.supportsOsBondingOnly) {
@@ -73,14 +95,28 @@ async function main(args: string[]): Promise<void> {
       return;
     }
 
-    transport = new OmronBleTransport(peripheral, device, logger);
-    await transport.initialize();
     if (options.pair) {
-      await transport.writeNewUnlockKey(pairingKey);
-      await transport.startTransmission();
-      await transport.endTransmission();
-      return;
+      if (process.platform === 'win32') await bondOnWindows(peripheral);
+      // The monitor may drop the link after bonding, so reconnect and retry.
+      for (let attempt = 1; ; attempt++) {
+        try {
+          transport = await initializeTransport(peripheral, device);
+          await transport.writeNewUnlockKey(pairingKey);
+          await transport.startTransmission();
+          await transport.endTransmission();
+          return;
+        } catch (error) {
+          if (!errorMessage(error).startsWith('Disconnected') || attempt >= 3) throw error;
+          logger.warn(`Connection dropped while pairing (attempt ${attempt}/3); reconnecting`);
+          await transport?.close().catch(() => undefined);
+          transport = undefined;
+          await delay(1000);
+          await peripheral.connectAsync();
+        }
+      }
     }
+
+    transport = await initializeTransport(peripheral, device);
 
     logger.info('Communication started');
     const records = await readDeviceRecords(transport, device, pairingKey, {
@@ -96,6 +132,46 @@ async function main(args: string[]): Promise<void> {
       if (transport) await transport.close();
     } finally {
       if (peripheral.state === 'connected') await peripheral.disconnectAsync();
+    }
+  }
+}
+
+async function bondOnWindows(peripheral: Peripheral): Promise<void> {
+  const maxAttempts = 3;
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    try {
+      await peripheral.pairAsync(windowsPairingKinds);
+      logger.info('Windows BLE bonding completed');
+      return;
+    } catch (error) {
+      logger.warn(`Windows BLE bonding failed (attempt ${attempt}/${maxAttempts}): ${errorMessage(error)}`);
+      if (attempt >= maxAttempts) return;
+      await delay(1000);
+      if (peripheral.state !== 'connected') await peripheral.connectAsync();
+    }
+  }
+}
+
+async function initializeTransport(peripheral: Peripheral, device: DeviceProfile): Promise<OmronBleTransport> {
+  const maxAttempts = 3;
+  for (let attempt = 1; ; attempt++) {
+    const transport = new OmronBleTransport(peripheral, device, logger);
+    try {
+      await transport.initialize();
+      return transport;
+    } catch (error) {
+      if (!errorMessage(error).startsWith('Disconnected')) throw error;
+      if (attempt >= maxAttempts) {
+        throw new Error(
+          `${device.model} dropped the Bluetooth connection during service discovery (${maxAttempts} attempts). ` +
+            'Start the monitor in Bluetooth pairing mode (-P- blinking) and run again with --pair; ' +
+            'after pairing succeeds, start the transfer mode on the monitor before reading.',
+          { cause: error },
+        );
+      }
+      logger.warn(`Connection dropped during service discovery (attempt ${attempt}/${maxAttempts}); reconnecting`);
+      await delay(1000);
+      await peripheral.connectAsync();
     }
   }
 }
@@ -182,7 +258,13 @@ async function discoverPeripherals(noble: Noble, target?: string): Promise<Perip
     noble.removeListener('discover', listener);
     if (scanning) await noble.stopScanningAsync();
   }
-  return [...discovered.values()].sort((left, right) => right.rssi - left.rssi);
+  return [...discovered.values()].sort(
+    (left, right) => Number(isOmronName(right)) - Number(isOmronName(left)) || right.rssi - left.rssi,
+  );
+}
+
+function isOmronName(peripheral: Peripheral): boolean {
+  return /^BLEsmart_/i.test(peripheral.advertisement.localName ?? '');
 }
 
 async function choosePeripheral(noble: Noble, initialPeripherals: Peripheral[]): Promise<Peripheral> {
@@ -195,7 +277,7 @@ async function choosePeripheral(noble: Noble, initialPeripherals: Peripheral[]):
       } else {
         console.log('Select an Omron device:');
         peripherals.forEach((peripheral, index) => {
-          console.log(`${index}: ${peripheral.address || peripheral.id}\t${peripheral.advertisement.localName || '(unnamed)'}\tRSSI ${peripheral.rssi}`);
+          console.log(`${index}: ${peripheral.address || peripheral.id}\t${peripheral.advertisement.localName || '(unnamed)'}\tRSSI ${peripheral.rssi}${isOmronName(peripheral) ? '\t<- Omron' : ''}`);
         });
       }
       const answer = await readline.question('Device number, or press Enter to rescan: ');
@@ -280,7 +362,10 @@ Plot options:
   -o, --output <file>   Output HTML file (default: <input-name>.html)`);
 }
 
-main(process.argv.slice(2)).catch((error: unknown) => {
-  console.error(`Error: ${errorMessage(error)}`);
-  process.exitCode = 1;
-});
+main(process.argv.slice(2)).then(
+  () => process.exit(),
+  (error: unknown) => {
+    console.error(`Error: ${errorMessage(error)}`);
+    process.exit(1);
+  },
+);
